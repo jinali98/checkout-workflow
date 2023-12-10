@@ -1,0 +1,113 @@
+service: checkout-workflow
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-2
+  environment:
+    INVENTORY_TABLE:
+      Ref: InventoryTable
+  iamRoleStatements:
+    - Effect: Allow
+      Action: dynamodb:*
+      Resource:
+        - Fn::GetAtt: [InventoryTable, Arn]
+
+plugins:
+  - serverless-step-functions
+
+functions:
+  checkInventory:
+    handler: handler.checkInventory
+  calculateTotal:
+    handler: handler.calculateTotal
+  redeemPoints:
+    handler: handler.redeemPoints
+  billCustomer:
+    handler: handler.billCustomer
+  prepareOrder:
+    handler: handler.prepareOrder
+
+stepFunctions:
+  stateMachines:
+    checkoutWorkflow:
+      name: checkoutWorkflow
+      definition:
+        StartAt: checkInventory
+        States:
+          checkInventory:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [checkInventory, Arn]
+            Catch:
+              - ErrorEquals: [ItemOutOfStock]
+                Next: ItemOutOfStock
+              - ErrorEquals: [ItemNotFound]
+                Next: ItemNotFound
+            ResultPath: "$.item"
+            Next: calculateTotal
+          calculateTotal:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [calculateTotal, Arn]
+            ResultPath: "$.total"
+            End: IsRedeemNeeded
+          IsRedeemNeeded:
+            Type: Choice
+            Choices:
+              - Variable: $.redeem
+                BooleanEquals: true
+                Next: RedeemPoints
+            Default: BillCustomer
+          RedeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [redeemPoints, Arn]
+            Next: BillCustomer
+          BillCustomer:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [billCustomer, Arn]
+            Next: PrepareOrder
+          PrepareOrder:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [prepareOrder, Arn]
+            End: true
+          ItemNotFound:
+            Type: Pass
+            Result: "Item Not Found"
+            End: true
+          ItemOutOfStock:
+            Type: Pass
+            Result: "Item is out of stock"
+            End: true
+
+# create a dynamodb table for inventory table  with on demand
+
+resources:
+  Resources:
+    InventoryTable:
+      Type: "AWS::DynamoDB::Table"
+      Properties:
+        TableName: inventory
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+    UserTable:
+      Type: "AWS::DynamoDB::Table"
+      Properties:
+        TableName: user
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
