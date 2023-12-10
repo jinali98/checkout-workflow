@@ -9,11 +9,23 @@ provider:
   environment:
     INVENTORY_TABLE:
       Ref: InventoryTable
+    USER_TABLE:
+      Ref: UserTable
   iamRoleStatements:
     - Effect: Allow
       Action: dynamodb:*
       Resource:
         - Fn::GetAtt: [InventoryTable, Arn]
+        - Fn::GetAtt: [UserTable, Arn]
+    - Effect: Allow
+      Action: sns:*
+      Resource: arn:aws:sns:us-east-2:<accountid>:NotifyCourier
+    - Effect: Allow
+      Action: sqs:*
+      Resource: arn:aws:sqs:us-east-2:<accountid>:OrderProcessingQueue
+    - Effect: Allow
+      Action: states:*
+      Resource: arn:aws:states:us-east-2:<accountid>:stateMachine:checkoutWorkflow
 
 plugins:
   - serverless-step-functions
@@ -29,6 +41,16 @@ functions:
     handler: handler.billCustomer
   prepareOrder:
     handler: handler.prepareOrder
+  restoreRedeemPoints:
+    handler: handler.restoreRedeemPoints
+  sqsWorker:
+    handler: handler.sqsWorker
+    events:
+      - sqs:
+          arn: arn:aws:sqs:us-east-2:<accountid>:OrderProcessingQueue
+          batchSize: 1
+  restoreQuantity:
+    handler: handler.restoreQuantity
 
 stepFunctions:
   stateMachines:
@@ -53,7 +75,7 @@ stepFunctions:
             Resource:
               Fn::GetAtt: [calculateTotal, Arn]
             ResultPath: "$.total"
-            End: IsRedeemNeeded
+            Next: IsRedeemNeeded
           IsRedeemNeeded:
             Type: Choice
             Choices:
@@ -65,16 +87,48 @@ stepFunctions:
             Type: Task
             Resource:
               Fn::GetAtt: [redeemPoints, Arn]
+            ResultPath: "$.total"
+            Catch:
+              - ErrorEquals: [States.All]
+                Next: redeemPointsError
             Next: BillCustomer
           BillCustomer:
             Type: Task
             Resource:
               Fn::GetAtt: [billCustomer, Arn]
+            ResultPath: "$.billingStatus"
+            Retry:
+              - ErrorEquals: [States.All]
+                MaxAttempts: 3
+            Catch:
+              - ErrorEquals: [States.All]
+                ResultPath: "$.customerBillingError"
+                Next: BillingError
             Next: PrepareOrder
           PrepareOrder:
             Type: Task
-            Resource:
-              Fn::GetAtt: [prepareOrder, Arn]
+            Resource: arn:aws:states:::sqs:sendMessage.waitForTaskToken
+            Parameters:
+              QueueUrl: https://sqs.us-east-2.amazonaws.com/<accountid>/OrderProcessingQueue
+              MessageBody:
+                Token.$: "$$.Task.Token"
+                Input.$: "$"
+            ResultPath: "$.courierStatus"
+            Catch:
+              - ErrorEquals: [NoCourierAvailable]
+                ResultPath: "$.courierError"
+                Next: RefundCustomer
+            Next: DispatchOrder
+          DispatchOrder:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: arn:aws:sns:us-east-2:<accountid>:NotifyCourier
+              Message.$: "$"
+            Next: Dispatched
+          Dispatched:
+            Type: Pass
+            Result: "Your order will be dispatched in 24 hours"
             End: true
           ItemNotFound:
             Type: Pass
@@ -84,6 +138,31 @@ stepFunctions:
             Type: Pass
             Result: "Item is out of stock"
             End: true
+          redeemPointsError:
+            Type: Pass
+            Result: "Error in redeeming points"
+            End: true
+          BillingError:
+            Type: Pass
+            Result: "Error in billing"
+            ResultPath: "$.billingError"
+            Next: RestoreRedeemPoints
+          RestoreRedeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreRedeemPoints, Arn]
+            End: true
+          RestoreQuantity:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreQuantity, Arn]
+            ResultPath: "$.quantityRestoreStatus"
+            Next: RestoreRedeemPoints
+          RefundCustomer:
+            Type: Pass
+            Result: "Customer is refunded"
+            ResultPath: "$.refundStatus"
+            Next: RestoreQuantity
 
 # create a dynamodb table for inventory table  with on demand
 
